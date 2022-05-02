@@ -1125,6 +1125,9 @@ static struct bio *f2fs_grab_read_bio(struct inode *inode, block_t blkaddr,
 
 static void f2fs_release_read_bio(struct bio *bio)
 {
+	if (bio->bi_alloc_ts)
+		mm_event_end(F2FS_READ_DATA, bio->bi_alloc_ts);
+
 	if (bio->bi_private)
 		mempool_free(bio->bi_private, bio_post_read_ctx_pool);
 	bio_put(bio);
@@ -2195,6 +2198,7 @@ submit_and_realloc:
 			bio = NULL;
 			goto out;
 		}
+		mm_event_start(&bio->bi_alloc_ts);
 	}
 
 	/*
@@ -2337,6 +2341,8 @@ submit_and_realloc:
 				*bio_ret = NULL;
 				return ret;
 			}
+			if (!for_write)
+				mm_event_start(&bio->bi_alloc_ts);
 		}
 
 		f2fs_wait_on_block_writeback(inode, blkaddr);
@@ -3982,12 +3988,16 @@ static int check_swap_activate(struct swap_info_struct *sis,
 			page_no < sis->max) {
 		unsigned block_in_page;
 		sector_t first_block;
+		sector_t block = 0;
+		int	 err = 0;
 
 		cond_resched();
 
-		first_block = bmap(inode, probe_block);
-		if (first_block == 0)
+		block = probe_block;
+		err = bmap(inode, &block);
+		if (err || !block)
 			goto bad_bmap;
+		first_block = block;
 
 		/*
 		 * It must be PAGE_SIZE aligned on-disk
@@ -3999,11 +4009,13 @@ static int check_swap_activate(struct swap_info_struct *sis,
 
 		for (block_in_page = 1; block_in_page < blocks_per_page;
 					block_in_page++) {
-			sector_t block;
 
-			block = bmap(inode, probe_block + block_in_page);
-			if (block == 0)
+			block = probe_block + block_in_page;
+			err = bmap(inode, &block);
+
+			if (err || !block)
 				goto bad_bmap;
+
 			if (block != first_block + block_in_page) {
 				/* Discontiguity */
 				probe_block++;

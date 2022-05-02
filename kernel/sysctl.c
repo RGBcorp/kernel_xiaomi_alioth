@@ -143,7 +143,6 @@ static int ten_thousand = 10000;
 #ifdef CONFIG_PERF_EVENTS
 static int six_hundred_forty_kb = 640 * 1024;
 #endif
-static int max_kswapd_threads = MAX_KSWAPD_THREADS;
 static int two_hundred_fifty_five = 255;
 static int __maybe_unused two_hundred_million = 200000000;
 
@@ -1680,13 +1679,6 @@ static struct ctl_table vm_table[] = {
 		.proc_handler	= proc_dointvec,
 	},
 	{
-		.procname       = "reap_mem_on_sigkill",
-		.data           = &sysctl_reap_mem_on_sigkill,
-		.maxlen         = sizeof(sysctl_reap_mem_on_sigkill),
-		.mode           = 0644,
-		.proc_handler   = proc_dointvec,
-	},
-	{
 		.procname	= "overcommit_ratio",
 		.data		= &sysctl_overcommit_ratio,
 		.maxlen		= sizeof(sysctl_overcommit_ratio),
@@ -1875,23 +1867,6 @@ static struct ctl_table vm_table[] = {
 		.mode		= 0644,
 		.proc_handler	= min_free_kbytes_sysctl_handler,
 		.extra1		= &zero,
-	},
-	{
-		.procname	= "watermark_boost_factor",
-		.data		= &watermark_boost_factor,
-		.maxlen		= sizeof(watermark_boost_factor),
-		.mode		= 0644,
-		.proc_handler	= watermark_boost_factor_sysctl_handler,
-		.extra1		= &zero,
-	},
-	{
-		.procname	= "kswapd_threads",
-		.data		= &kswapd_threads,
-		.maxlen		= sizeof(kswapd_threads),
-		.mode		= 0644,
-		.proc_handler	= kswapd_threads_sysctl_handler,
-		.extra1		= &one,
-		.extra2		= &max_kswapd_threads,
 	},
 	{
 		.procname	= "watermark_scale_factor",
@@ -2092,6 +2067,13 @@ static struct ctl_table vm_table[] = {
 		.maxlen		= sizeof(sysctl_admin_reserve_kbytes),
 		.mode		= 0644,
 		.proc_handler	= proc_doulongvec_minmax,
+	},
+	{
+		.procname	= "min_filelist_kbytes",
+		.data		= &min_filelist_kbytes,
+		.maxlen		= sizeof(min_filelist_kbytes),
+		.mode		= 0644,
+		.proc_handler	= min_filelist_kbytes_handler,
 	},
 #ifdef CONFIG_HAVE_ARCH_MMAP_RND_BITS
 	{

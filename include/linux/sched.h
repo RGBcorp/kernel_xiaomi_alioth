@@ -47,7 +47,6 @@ struct pid_namespace;
 struct pipe_inode_info;
 struct rcu_node;
 struct reclaim_state;
-struct capture_control;
 struct robust_list_head;
 struct sched_attr;
 struct sched_param;
@@ -975,11 +974,11 @@ struct task_struct {
 #ifndef TIF_RESTORE_SIGMASK
 	unsigned			restore_sigmask:1;
 #endif
-#ifdef CONFIG_MEMCG
+#ifdef CONFIG_MMU
 	unsigned			in_user_fault:1;
+#endif
 #ifdef CONFIG_MEMCG_KMEM
 	unsigned			memcg_kmem_skip_account:1;
-#endif
 #endif
 #ifdef CONFIG_COMPAT_BRK
 	unsigned			brk_randomized:1;
@@ -1221,9 +1220,6 @@ struct task_struct {
 
 	struct io_context		*io_context;
 
-#ifdef CONFIG_COMPACTION
-	struct capture_control		*capture_control;
-#endif
 	/* Ptrace state: */
 	unsigned long			ptrace_message;
 	siginfo_t			*last_siginfo;

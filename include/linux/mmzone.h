@@ -37,8 +37,6 @@
  */
 #define PAGE_ALLOC_COSTLY_ORDER 3
 
-#define MAX_KSWAPD_THREADS 16
-
 enum migratetype {
 	MIGRATE_UNMOVABLE,
 	MIGRATE_MOVABLE,
@@ -233,18 +231,137 @@ static inline int is_active_lru(enum lru_list lru)
 	return (lru == LRU_ACTIVE_ANON || lru == LRU_ACTIVE_FILE);
 }
 
+#define ANON_AND_FILE 2
+
 struct zone_reclaim_stat {
 	/*
 	 * The pageout code in vmscan.c keeps track of how many of the
 	 * mem/swap backed and file backed pages are referenced.
 	 * The higher the rotated/scanned ratio, the more valuable
 	 * that cache is.
-	 *
-	 * The anon LRU stats live in [0], file LRU stats in [1]
 	 */
-	unsigned long		recent_rotated[2];
-	unsigned long		recent_scanned[2];
+	unsigned long		recent_rotated[ANON_AND_FILE];
+	unsigned long		recent_scanned[ANON_AND_FILE];
 };
+
+struct lruvec;
+struct page_vma_mapped_walk;
+
+#define LRU_GEN_MASK		((BIT(LRU_GEN_WIDTH) - 1) << LRU_GEN_PGOFF)
+#define LRU_USAGE_MASK		((BIT(LRU_USAGE_WIDTH) - 1) << LRU_USAGE_PGOFF)
+
+#ifdef CONFIG_LRU_GEN
+
+/*
+ * For each lruvec, evictable pages are divided into multiple generations. The
+ * youngest and the oldest generation numbers, AKA max_seq and min_seq, are
+ * monotonically increasing. The sliding window technique is used to track at
+ * most MAX_NR_GENS and at least MIN_NR_GENS generations. An offset within the
+ * window, AKA gen, indexes an array of per-type and per-zone lists for the
+ * corresponding generation. The counter in page->flags stores gen+1 while a
+ * page is on one of the multigenerational lru lists. Otherwise, it stores 0.
+ */
+#define MAX_NR_GENS		((unsigned int)CONFIG_NR_LRU_GENS)
+
+/*
+ * Each generation is then divided into multiple tiers. Tiers represent levels
+ * of usage from file descriptors, i.e., mark_page_accessed(). In contrast to
+ * moving across generations which requires the lru lock, moving across tiers
+ * only involves an atomic operation on page->flags and therefore has a
+ * negligible cost.
+ *
+ * The purposes of tiers are to:
+ *   1) estimate whether pages accessed multiple times via file descriptors are
+ *   more active than pages accessed only via page tables by separating the two
+ *   access types into upper tiers and the base tier and comparing refault rates
+ *   across tiers.
+ *   2) improve buffered io performance by deferring activations of pages
+ *   accessed multiple times until the eviction. That is activations happen in
+ *   the reclaim path, not the access path.
+ *
+ * Pages accessed N times via file descriptors belong to tier order_base_2(N).
+ * The base tier uses the following page flag:
+ *   !PageReferenced() -- readahead pages
+ *   PageReferenced() -- single-access pages
+ * All upper tiers use the following page flags:
+ *   PageReferenced() && PageWorkingset() -- multi-access pages
+ * in addition to the bits storing N-2 accesses. Therefore, we can support one
+ * upper tier without using additional bits in page->flags.
+ *
+ * Note that
+ *   1) PageWorkingset() is always set for upper tiers because we want to
+ *    maintain the existing psi behavior.
+ *   2) !PageReferenced() && PageWorkingset() is not a valid tier. See the
+ *   comment in evict_pages().
+ *
+ * Pages from the base tier are evicted regardless of its refault rate. Pages
+ * from upper tiers will be moved to the next generation, if their refault rates
+ * are higher than that of the base tier.
+ */
+#define MAX_NR_TIERS		((unsigned int)CONFIG_TIERS_PER_GEN)
+#define LRU_TIER_FLAGS		(BIT(PG_referenced) | BIT(PG_workingset))
+#define LRU_USAGE_SHIFT		(CONFIG_TIERS_PER_GEN - 1)
+
+/* Whether to keep historical stats for each generation. */
+#ifdef CONFIG_LRU_GEN_STATS
+#define NR_STAT_GENS		((unsigned int)CONFIG_NR_LRU_GENS)
+#else
+#define NR_STAT_GENS		1U
+#endif
+
+struct lrugen {
+	/* the aging increments the max generation number */
+	unsigned long max_seq;
+	/* the eviction increments the min generation numbers */
+	unsigned long min_seq[ANON_AND_FILE];
+	/* the birth time of each generation in jiffies */
+	unsigned long timestamps[MAX_NR_GENS];
+	/* the multigenerational lru lists */
+	struct list_head lists[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
+	/* the sizes of the multigenerational lru lists in pages */
+	unsigned long sizes[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
+	/* to determine which type and its tiers to evict */
+	atomic_long_t evicted[NR_STAT_GENS][ANON_AND_FILE][MAX_NR_TIERS];
+	atomic_long_t refaulted[NR_STAT_GENS][ANON_AND_FILE][MAX_NR_TIERS];
+	/* the base tier won't be activated */
+	unsigned long activated[NR_STAT_GENS][ANON_AND_FILE][MAX_NR_TIERS - 1];
+	/* arithmetic mean weighted by geometric series 1/2, 1/4, ... */
+	unsigned long avg_total[ANON_AND_FILE][MAX_NR_TIERS];
+	unsigned long avg_refaulted[ANON_AND_FILE][MAX_NR_TIERS];
+	/* whether the multigenerational lru is enabled */
+	bool enabled[ANON_AND_FILE];
+};
+
+void lru_gen_init_lruvec(struct lruvec *lruvec);
+void lru_gen_set_state(bool enable, bool main, bool swap);
+void *lru_gen_eviction(struct page *page);
+void lru_gen_refault(struct page *page, void *shadow);
+void lru_gen_scan_around(struct page_vma_mapped_walk *pvmw);
+
+#else /* CONFIG_LRU_GEN */
+
+static inline void lru_gen_init_lruvec(struct lruvec *lruvec)
+{
+}
+
+static inline void lru_gen_set_state(bool enable, bool main, bool swap)
+{
+}
+
+static inline void *lru_gen_eviction(struct page *page)
+{
+	return NULL;
+}
+
+static inline void lru_gen_refault(struct page *page, void *shadow)
+{
+}
+
+static inline void lru_gen_scan_around(struct page_vma_mapped_walk *pvmw)
+{
+}
+
+#endif /* CONFIG_LRU_GEN */
 
 struct lruvec {
 	struct list_head		lists[NR_LRU_LISTS];
@@ -253,6 +370,10 @@ struct lruvec {
 	atomic_long_t			inactive_age;
 	/* Refaults at the time of last reclaim cycle */
 	unsigned long			refaults;
+#ifdef CONFIG_LRU_GEN
+	/* unevictable pages are on LRU_UNEVICTABLE */
+	struct lrugen			evictable;
+#endif
 #ifdef CONFIG_MEMCG
 	struct pglist_data *pgdat;
 #endif
@@ -280,10 +401,9 @@ enum zone_watermarks {
 	NR_WMARK
 };
 
-#define min_wmark_pages(z) (z->_watermark[WMARK_MIN] + z->watermark_boost)
-#define low_wmark_pages(z) (z->_watermark[WMARK_LOW] + z->watermark_boost)
-#define high_wmark_pages(z) (z->_watermark[WMARK_HIGH] + z->watermark_boost)
-#define wmark_pages(z, i) (z->_watermark[i] + z->watermark_boost)
+#define min_wmark_pages(z) (z->watermark[WMARK_MIN])
+#define low_wmark_pages(z) (z->watermark[WMARK_LOW])
+#define high_wmark_pages(z) (z->watermark[WMARK_HIGH])
 
 struct per_cpu_pages {
 	int count;		/* number of pages in the list */
@@ -370,12 +490,13 @@ enum zone_type {
 
 #ifndef __GENERATING_BOUNDS_H
 
+#define ASYNC_AND_SYNC 2
+
 struct zone {
 	/* Read-mostly fields */
 
 	/* zone watermarks, access with *_wmark_pages(zone) macros */
-	unsigned long _watermark[NR_WMARK];
-	unsigned long watermark_boost;
+	unsigned long watermark[NR_WMARK];
 
 	unsigned long nr_reserved_highatomic;
 
@@ -499,10 +620,8 @@ struct zone {
 #if defined CONFIG_COMPACTION || defined CONFIG_CMA
 	/* pfn where compaction free scanner should start */
 	unsigned long		compact_cached_free_pfn;
-	/* pfn where async and sync compaction migration scanner should start */
-	unsigned long		compact_cached_migrate_pfn[2];
-	unsigned long		compact_init_migrate_pfn;
-	unsigned long		compact_init_free_pfn;
+	/* pfn where compaction migration scanner should start */
+	unsigned long		compact_cached_migrate_pfn[ASYNC_AND_SYNC];
 #endif
 
 #ifdef CONFIG_COMPACTION
@@ -546,12 +665,6 @@ enum pgdat_flags {
 					 * many pages under writeback
 					 */
 	PGDAT_RECLAIM_LOCKED,		/* prevents concurrent reclaim */
-};
-
-enum zone_flags {
-	ZONE_BOOSTED_WATERMARK,		/* zone recently boosted watermarks.
-					 * Cleared when kswapd is woken.
-					 */
 };
 
 static inline unsigned long zone_end_pfn(const struct zone *zone)
@@ -644,6 +757,8 @@ struct zonelist {
 extern struct page *mem_map;
 #endif
 
+struct mm_walk_args;
+
 /*
  * On NUMA machines, each NUMA node would have a pg_data_t to describe
  * it's memory layout. On UMA machines there is a single pglist_data which
@@ -688,10 +803,8 @@ typedef struct pglist_data {
 	int node_id;
 	wait_queue_head_t kswapd_wait;
 	wait_queue_head_t pfmemalloc_wait;
-	/*
-	 * Protected by mem_hotplug_begin/end()
-	 */
-	struct task_struct *kswapd[MAX_KSWAPD_THREADS];
+	struct task_struct *kswapd;	/* Protected by
+					   mem_hotplug_begin/end() */
 	int kswapd_order;
 	enum zone_type kswapd_classzone_idx;
 
@@ -742,6 +855,9 @@ typedef struct pglist_data {
 
 	unsigned long		flags;
 
+#ifdef CONFIG_LRU_GEN
+	struct mm_walk_args	*mm_walk_args;
+#endif
 	ZONE_PADDING(_pad2_)
 
 	/* Per-node vmstats */
@@ -923,11 +1039,7 @@ static inline int is_highmem(struct zone *zone)
 
 /* These two functions are used to setup the per zone pages min values */
 struct ctl_table;
-int kswapd_threads_sysctl_handler(struct ctl_table *, int,
-					void __user *, size_t *, loff_t *);
 int min_free_kbytes_sysctl_handler(struct ctl_table *, int,
-					void __user *, size_t *, loff_t *);
-int watermark_boost_factor_sysctl_handler(struct ctl_table *, int,
 					void __user *, size_t *, loff_t *);
 int watermark_scale_factor_sysctl_handler(struct ctl_table *, int,
 					void __user *, size_t *, loff_t *);
